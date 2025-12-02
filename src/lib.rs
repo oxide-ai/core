@@ -1,133 +1,169 @@
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
-use wgpu::{Instance, InstanceDescriptor};
+use candle_core::{Device, Tensor};
+use anyhow::Result as AnyhowResult;
 
-/// Initialize WebGPU adapter and return GPU information
+/// OxideEngine - Main struct for GPU-accelerated ML operations using Candle
 #[napi]
-pub fn initialize_webgpu() -> Result<String> {
-    // Initialize logging for debugging
-    let _ = env_logger::try_init_from_env(env_logger::Env::default().default_filter_or("info"));
+pub struct OxideEngine {
+    device: Device,
+}
 
-    // Create a Tokio runtime for async operations
-    let rt = tokio::runtime::Runtime::new()
-        .map_err(|e| Error::from_reason(format!("Failed to create runtime: {}", e)))?;
+#[napi]
+impl OxideEngine {
+    /// Create a new OxideEngine instance with Metal backend (macOS) or CPU fallback
+    #[napi(constructor)]
+    pub fn new() -> Result<Self> {
+        // Initialize logging
+        let _ = env_logger::try_init_from_env(env_logger::Env::default().default_filter_or("info"));
 
-    // Run async code in blocking context
-    rt.block_on(async {
-        // Create WebGPU instance with default backends
-        let instance = Instance::new(InstanceDescriptor {
-            backends: wgpu::Backends::all(),
-            ..Default::default()
-        });
+        log::info!("Initializing OxideEngine with GPU backend...");
 
-        // Request adapter (GPU access)
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                compatible_surface: None,
-                force_fallback_adapter: false,
-            })
-            .await;
+        // Create GPU device using Candle (Metal on macOS, CPU otherwise)
+        let device = Self::create_wgpu_device()
+            .map_err(|e| Error::from_reason(format!("Failed to initialize GPU device: {}", e)))?;
 
-        match adapter {
-            Some(adapter) => {
-                // Get adapter info
-                let info = adapter.get_info();
+        log::info!("OxideEngine initialized successfully with device: {:?}", device);
 
-                // Format success message with GPU details
-                let message = format!(
-                    "✓ WebGPU initialized successfully!\n\
-                     GPU Name: {}\n\
-                     Backend: {:?}\n\
-                     Driver: {}\n\
-                     Vendor: {:#x}\n\
-                     Device: {:#x}",
-                    info.name,
-                    info.backend,
-                    info.driver,
-                    info.vendor,
-                    info.device
-                );
+        Ok(Self { device })
+    }
 
-                log::info!("WebGPU adapter acquired: {}", info.name);
-
-                Ok(message)
-            }
-            None => {
-                let error_msg = "✗ Failed to find a suitable GPU adapter";
-                log::error!("{}", error_msg);
-                Err(Error::from_reason(error_msg))
+    /// Internal method to create GPU device (Metal on macOS)
+    fn create_wgpu_device() -> AnyhowResult<Device> {
+        // Try to create Metal device (macOS) or fall back to CPU
+        #[cfg(target_os = "macos")]
+        {
+            log::info!("Creating Metal GPU device for macOS...");
+            match Device::new_metal(0) {
+                Ok(device) => {
+                    log::info!("Metal GPU device created successfully");
+                    Ok(device)
+                }
+                Err(e) => {
+                    log::warn!("Failed to create Metal device: {}, falling back to CPU", e);
+                    Ok(Device::Cpu)
+                }
             }
         }
-    })
-}
 
-/// Get available GPU adapters without initializing
-#[napi]
-pub fn list_adapters() -> Result<Vec<String>> {
-    let instance = Instance::new(InstanceDescriptor {
-        backends: wgpu::Backends::all(),
-        ..Default::default()
-    });
+        #[cfg(not(target_os = "macos"))]
+        {
+            log::info!("Metal not available on this platform, using CPU");
+            Ok(Device::Cpu)
+        }
+    }
 
-    // Enumerate all available adapters
-    let adapters: Vec<String> = instance
-        .enumerate_adapters(wgpu::Backends::all())
-        .into_iter()
-        .map(|adapter| {
-            let info = adapter.get_info();
-            format!("{} ({:?})", info.name, info.backend)
-        })
-        .collect();
+    /// Get device information as a string
+    #[napi]
+    pub fn get_device_info(&self) -> String {
+        format!("Device: {:?}", self.device)
+    }
 
-    Ok(adapters)
-}
+    /// Test GPU compute capability by performing a simple tensor operation
+    /// Creates two tensors on the GPU, adds them, and returns the result
+    #[napi]
+    pub fn test_gpu_compute(&self) -> Result<String> {
+        log::info!("Starting GPU compute test...");
 
-/// Get detailed GPU capabilities
-#[napi]
-pub fn get_gpu_capabilities() -> Result<GpuCapabilities> {
-    let rt = tokio::runtime::Runtime::new()
-        .map_err(|e| Error::from_reason(format!("Failed to create runtime: {}", e)))?;
+        // Perform tensor operations
+        let result = self.perform_tensor_addition()
+            .map_err(|e| Error::from_reason(format!("GPU compute test failed: {}", e)))?;
 
-    rt.block_on(async {
-        let instance = Instance::new(InstanceDescriptor {
-            backends: wgpu::Backends::all(),
-            ..Default::default()
-        });
+        log::info!("GPU compute test completed successfully");
 
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                compatible_surface: None,
-                force_fallback_adapter: false,
-            })
-            .await
-            .ok_or_else(|| Error::from_reason("No GPU adapter found"))?;
+        Ok(result)
+    }
 
-        let info = adapter.get_info();
-        let limits = adapter.limits();
-        let features = adapter.features();
+    /// Internal method to perform tensor addition on GPU
+    fn perform_tensor_addition(&self) -> AnyhowResult<String> {
+        // Create first tensor with value [10.0]
+        let tensor_a = Tensor::new(&[10.0f32], &self.device)?;
+        log::info!("Created tensor A: {:?}", tensor_a);
 
-        Ok(GpuCapabilities {
-            name: info.name.clone(),
-            backend: format!("{:?}", info.backend),
-            max_texture_dimension_2d: limits.max_texture_dimension_2d,
-            max_bind_groups: limits.max_bind_groups,
-            // Convert u64 to f64 for JavaScript compatibility
-            max_buffer_size: limits.max_buffer_size as f64,
-            supports_timestamps: features.contains(wgpu::Features::TIMESTAMP_QUERY),
-        })
-    })
-}
+        // Create second tensor with value [20.0]
+        let tensor_b = Tensor::new(&[20.0f32], &self.device)?;
+        log::info!("Created tensor B: {:?}", tensor_b);
 
-/// Struct representing GPU capabilities (exported to Node.js)
-#[napi(object)]
-pub struct GpuCapabilities {
-    pub name: String,
-    pub backend: String,
-    pub max_texture_dimension_2d: u32,
-    pub max_bind_groups: u32,
-    // Use f64 instead of u64 for JavaScript compatibility (JS doesn't have 64-bit integers)
-    pub max_buffer_size: f64,
-    pub supports_timestamps: bool,
+        // Perform addition on GPU
+        let result_tensor = (&tensor_a + &tensor_b)?;
+        log::info!("Addition result tensor: {:?}", result_tensor);
+
+        // Convert result back to CPU for reading
+        let result_value: Vec<f32> = result_tensor.to_vec1()?;
+
+        // Format result
+        let output = format!(
+            "✓ GPU Compute Test Successful!\n\
+             \n\
+             Operation: Tensor Addition on GPU\n\
+             Device: {:?}\n\
+             \n\
+             Tensor A: [10.0]\n\
+             Tensor B: [20.0]\n\
+             Result:   [{:.1}]\n\
+             \n\
+             Computation performed on GPU using Candle framework",
+            self.device,
+            result_value[0]
+        );
+
+        Ok(output)
+    }
+
+    /// Perform a more complex computation: element-wise multiplication
+    #[napi]
+    pub fn test_multiply(&self, a: f64, b: f64) -> Result<String> {
+        log::info!("Testing GPU multiplication: {} * {}", a, b);
+
+        let result = self.perform_multiplication(a as f32, b as f32)
+            .map_err(|e| Error::from_reason(format!("Multiplication test failed: {}", e)))?;
+
+        Ok(result)
+    }
+
+    /// Internal method to perform multiplication on GPU
+    fn perform_multiplication(&self, a: f32, b: f32) -> AnyhowResult<String> {
+        // Create tensors
+        let tensor_a = Tensor::new(&[a], &self.device)?;
+        let tensor_b = Tensor::new(&[b], &self.device)?;
+
+        // Perform multiplication on GPU
+        let result_tensor = (&tensor_a * &tensor_b)?;
+
+        // Get result
+        let result_value: Vec<f32> = result_tensor.to_vec1()?;
+
+        let output = format!(
+            "✓ GPU Multiplication Test\n\
+             {} × {} = {:.2}\n\
+             Device: {:?}",
+            a, b, result_value[0], self.device
+        );
+
+        Ok(output)
+    }
+
+    /// Create a simple tensor and return its shape information
+    #[napi]
+    pub fn create_tensor_info(&self, values: Vec<f64>) -> Result<String> {
+        // Convert f64 to f32 for tensor creation
+        let f32_values: Vec<f32> = values.iter().map(|&v| v as f32).collect();
+        let tensor = Tensor::new(&f32_values[..], &self.device)
+            .map_err(|e| Error::from_reason(format!("Failed to create tensor: {}", e)))?;
+
+        let shape = tensor.shape();
+        let dims = shape.dims();
+
+        Ok(format!(
+            "Tensor created on GPU\n\
+             Shape: {:?}\n\
+             Dimensions: {:?}\n\
+             Element count: {}\n\
+             Device: {:?}",
+            shape,
+            dims,
+            tensor.elem_count(),
+            self.device
+        ))
+    }
 }

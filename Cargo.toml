@@ -13,8 +13,11 @@ crate-type = ["cdylib"]
 napi = "3.0.0"
 napi-derive = "3.0.0"
 
-# WebGPU & Async Runtime
-wgpu = "0.19" # O l'ultima versione stabile
+# Candle ML framework with Metal backend for macOS
+candle-core = { version = "0.9", features = ["metal"] }
+anyhow = "1.0"
+
+# Async Runtime & Logging
 tokio = { version = "1", features = ["full"] }
 log = "0.4"
 env_logger = "0.11"

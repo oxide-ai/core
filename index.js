@@ -572,6 +572,4 @@ if (!nativeBinding) {
 }
 
 module.exports = nativeBinding
-module.exports.getGpuCapabilities = nativeBinding.getGpuCapabilities
-module.exports.initializeWebgpu = nativeBinding.initializeWebgpu
-module.exports.listAdapters = nativeBinding.listAdapters
+module.exports.OxideEngine = nativeBinding.OxideEngine
