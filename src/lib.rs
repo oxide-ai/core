@@ -4,6 +4,8 @@ use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use candle_core::{Device, IndexOp, Tensor};
 use candle_nn::VarBuilder;
+use candle_transformers::generation::LogitsProcessor;
+use tokenizers::Tokenizer;
 use anyhow::Result as AnyhowResult;
 use std::path::PathBuf;
 
@@ -15,6 +17,8 @@ pub struct OxideEngine {
     device: Device,
     model: Option<Model>,
     kv_cache: Option<KVCache>,
+    tokenizer: Option<Tokenizer>,
+    logits_processor: LogitsProcessor,
 }
 
 #[napi]
@@ -33,10 +37,18 @@ impl OxideEngine {
 
         log::info!("OxideEngine initialized successfully with device: {:?}", device);
 
+        // Initialize LogitsProcessor with default parameters
+        let seed = 42;
+        let temperature = 0.8;
+        let top_p = Some(0.9);
+        let logits_processor = LogitsProcessor::new(seed, Some(temperature), top_p);
+
         Ok(Self {
             device,
             model: None,
             kv_cache: None,
+            tokenizer: None,
+            logits_processor,
         })
     }
 
@@ -71,19 +83,26 @@ impl OxideEngine {
         format!("Device: {:?}", self.device)
     }
 
-    /// Load a Phi-3 model from a safetensors file
+    /// Load a Phi-3 model from a safetensors file with tokenizer
     #[napi]
-    pub fn load_model(&mut self, model_path: String, config_path: Option<String>) -> Result<String> {
+    pub fn load_model(&mut self, model_path: String, tokenizer_path: String, config_path: Option<String>) -> Result<String> {
         log::info!("Loading model from: {}", model_path);
+        log::info!("Loading tokenizer from: {}", tokenizer_path);
 
-        let result = self.load_model_internal(model_path, config_path)
+        let result = self.load_model_internal(model_path, tokenizer_path, config_path)
             .map_err(|e| Error::from_reason(format!("Failed to load model: {}", e)))?;
 
         Ok(result)
     }
 
-    /// Internal method to load the model
-    fn load_model_internal(&mut self, model_path: String, config_path: Option<String>) -> AnyhowResult<String> {
+    /// Internal method to load the model and tokenizer
+    fn load_model_internal(&mut self, model_path: String, tokenizer_path: String, config_path: Option<String>) -> AnyhowResult<String> {
+        // Load tokenizer
+        log::info!("Loading tokenizer...");
+        let tokenizer = Tokenizer::from_file(&tokenizer_path)
+            .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {}", e))?;
+        log::info!("Tokenizer loaded successfully");
+
         // Load config
         let config = if let Some(config_path) = config_path {
             log::info!("Loading config from: {}", config_path);
@@ -110,13 +129,14 @@ impl OxideEngine {
         let num_layers = config.num_hidden_layers;
         let kv_cache = KVCache::new(num_layers);
 
-        log::info!("Model loaded successfully into VRAM with KV cache initialized");
+        log::info!("Model and tokenizer loaded successfully into VRAM with KV cache initialized");
 
         self.model = Some(model);
         self.kv_cache = Some(kv_cache);
+        self.tokenizer = Some(tokenizer);
 
         Ok(format!(
-            "✓ Model loaded successfully!\n\
+            "✓ Model and tokenizer loaded successfully!\n\
              \n\
              Config:\n\
              - Vocabulary size: {}\n\
@@ -126,12 +146,13 @@ impl OxideEngine {
              - Max position embeddings: {}\n\
              \n\
              Device: {:?}\n\
-             Status: Model loaded in VRAM with KV caching enabled\n\
+             Status: Ready for text generation\n\
              \n\
-             Performance Optimizations:\n\
-             ✓ KV Cache: Enabled (O(1) complexity for history)\n\
-             ✓ RoPE: Pre-computed for all positions\n\
-             ✓ Ready for real-time token generation",
+             Features:\n\
+             ✓ KV Cache: Enabled (O(1) complexity)\n\
+             ✓ RoPE: Pre-computed\n\
+             ✓ Tokenizer: Loaded\n\
+             ✓ LogitsProcessor: Temp=0.8, TopP=0.9",
             config.vocab_size,
             config.hidden_size,
             config.num_hidden_layers,
@@ -139,6 +160,95 @@ impl OxideEngine {
             config.max_position_embeddings,
             self.device
         ))
+    }
+
+    /// Generate text from a prompt
+    #[napi]
+    pub fn generate_text(&mut self, prompt: String, max_tokens: u32) -> Result<String> {
+        log::info!("Generating text from prompt: '{}', max_tokens: {}", prompt, max_tokens);
+
+        let result = self.generate_text_internal(&prompt, max_tokens as usize)
+            .map_err(|e| Error::from_reason(format!("Text generation failed: {}", e)))?;
+
+        Ok(result)
+    }
+
+    /// Internal text generation implementation
+    fn generate_text_internal(&mut self, prompt: &str, max_tokens: usize) -> AnyhowResult<String> {
+        let model = self.model.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Model not loaded. Call load_model() first."))?;
+
+        let kv_cache = self.kv_cache.as_mut()
+            .ok_or_else(|| anyhow::anyhow!("KV cache not initialized. Call load_model() first."))?;
+
+        let tokenizer = self.tokenizer.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Tokenizer not loaded. Call load_model() first."))?;
+
+        // Encode the prompt
+        let encoding = tokenizer
+            .encode(prompt, false)
+            .map_err(|e| anyhow::anyhow!("Failed to encode prompt: {}", e))?;
+
+        let mut token_ids: Vec<u32> = encoding.get_ids().to_vec();
+        let prompt_len = token_ids.len();
+
+        log::info!("Prompt encoded to {} tokens", prompt_len);
+
+        // Get EOS token ID
+        let eos_token_id = tokenizer
+            .token_to_id("<|endoftext|>")
+            .or_else(|| tokenizer.token_to_id("</s>"))
+            .unwrap_or(0);
+
+        log::info!("EOS token ID: {}", eos_token_id);
+
+        // Process prompt tokens (prefill phase)
+        log::info!("Processing prompt tokens...");
+        let input_ids = Tensor::new(&token_ids[..], &self.device)?.unsqueeze(0)?;
+        let _logits = model.forward(&input_ids, kv_cache)?;
+
+        log::info!("Prompt processed, starting generation...");
+
+        // Generate tokens one by one
+        let mut generated_text = String::new();
+        let mut generated_count = 0;
+
+        for step in 0..max_tokens {
+            // Get last token and run forward pass
+            let last_token = *token_ids.last().unwrap();
+            let input_tensor = Tensor::new(&[last_token], &self.device)?.unsqueeze(0)?;
+
+            let logits = model.forward(&input_tensor, kv_cache)?;
+
+            // Get logits for last token
+            let last_logits = logits.i((0, 0))?;
+
+            // Sample next token using logits processor
+            let next_token = self.logits_processor.sample(&last_logits)?;
+
+            // Check for EOS
+            if next_token == eos_token_id {
+                log::info!("EOS token generated at step {}", step);
+                break;
+            }
+
+            // Decode token to string
+            let token_str = tokenizer
+                .decode(&[next_token], false)
+                .map_err(|e| anyhow::anyhow!("Failed to decode token: {}", e))?;
+
+            generated_text.push_str(&token_str);
+            token_ids.push(next_token);
+            generated_count += 1;
+
+            if step % 10 == 0 {
+                log::info!("Generated {} tokens...", step + 1);
+            }
+        }
+
+        log::info!("Generation complete: {} tokens generated", generated_count);
+
+        Ok(generated_text)
     }
 
     /// Reset KV cache - call this when starting a new conversation
