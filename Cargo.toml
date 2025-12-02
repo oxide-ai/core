@@ -1,6 +1,6 @@
 
 [package]
-authors = ["LongYinan <lynweklm@gmail.com>"]
+authors = ["oxide-ai"]
 edition = "2021"
 name = "core"
 version = "0.1.0"
