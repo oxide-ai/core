@@ -1,10 +1,11 @@
 /**
  * Test script for text generation using OxideEngine
- * Run with: node test-gen.js [path-to-model.safetensors] [path-to-tokenizer.json] [path-to-config.json]
+ * Run with: node test-gen.js [path-to-model-file-or-dir] [path-to-tokenizer.json] [path-to-config.json]
  */
 
 const path = require('path');
 const fs = require('fs');
+const { OxideEngine } = require('./index.js');
 
 // ANSI color codes
 const colors = {
@@ -40,37 +41,6 @@ function printWarning(text) {
   console.log(`${colors.yellow}⚠${colors.reset} ${text}`);
 }
 
-// Load the native module
-let OxideEngine;
-try {
-  const platform = process.platform;
-  const arch = process.arch;
-  const platformMap = {
-    'darwin-arm64': 'darwin-arm64',
-    'darwin-x64': 'darwin-x64',
-    'linux-x64': 'linux-x64-gnu',
-    'win32-x64': 'win32-x64-msvc',
-  };
-  const platformKey = `${platform}-${arch}`;
-  const platformSuffix = platformMap[platformKey] || 'unknown';
-  const binaryName = `core.${platformSuffix}.node`;
-  const binaryPath = path.join(__dirname, binaryName);
-
-  if (fs.existsSync(binaryPath)) {
-    const nativeModule = require(binaryPath);
-    OxideEngine = nativeModule.OxideEngine;
-    printSuccess(`Loaded native module: ${binaryName}`);
-  } else {
-    throw new Error(`Binary not found: ${binaryName}`);
-  }
-} catch (error) {
-  printError('Failed to load native module');
-  console.error(`${colors.red}Error: ${error.message}${colors.reset}`);
-  console.error('\nPlease build the project first:');
-  console.error('  npm run build');
-  process.exit(1);
-}
-
 async function runTests() {
   console.clear();
   console.log(`${colors.bright}${colors.magenta}OxideEngine Text Generation Test${colors.reset}`);
@@ -84,14 +54,23 @@ async function runTests() {
   if (!modelPath || !tokenizerPath) {
     printWarning('Model path or tokenizer path not provided');
     console.log('\nUsage:');
-    console.log('  node test-gen.js <model.safetensors> <tokenizer.json> [config.json]');
-    console.log('\nExample:');
-    console.log('  node test-gen.js ./models/model.safetensors ./models/tokenizer.json ./models/config.json');
+    console.log('  node test-gen.js <model_path> <tokenizer.json> [config.json]');
+    console.log('\nArguments:');
+    console.log('  model_path: Path to a specific .safetensors file OR a directory containing sharded files');
+    console.log('  tokenizer.json: Path to the tokenizer file');
+    console.log('  config.json: (Optional) Path to model config');
+    
+    console.log('\nExample (Single File):');
+    console.log('  node test-gen.js ./models/model.safetensors ./models/tokenizer.json');
+    
+    console.log('\nExample (Sharded/Directory):');
+    console.log('  node test-gen.js ./models/ ./models/tokenizer.json');
+
     console.log('\nNote: If config.json is not provided, default Phi-3-mini config will be used.');
     console.log('\nYou can download Phi-3 models from Hugging Face:');
     console.log('  https://huggingface.co/microsoft/Phi-3-mini-4k-instruct');
     console.log('\nFiles needed:');
-    console.log('  - model.safetensors (model weights)');
+    console.log('  - model.safetensors (or model-00001... etc)');
     console.log('  - tokenizer.json (tokenizer vocabulary)');
     console.log('  - config.json (optional, model configuration)');
     console.log('\nFor now, running basic GPU test without model loading...\n');
@@ -128,8 +107,18 @@ async function runTests() {
   try {
     // Verify files exist
     if (!fs.existsSync(modelPath)) {
-      throw new Error(`Model file not found: ${modelPath}`);
+      throw new Error(`Model path not found: ${modelPath}`);
     }
+    
+    // Check if model path is directory or file
+    const stats = fs.statSync(modelPath);
+    if (stats.isDirectory()) {
+        printInfo(`Model path is a directory: ${modelPath}`);
+        // We trust the engine to find .safetensors inside
+    } else if (stats.isFile()) {
+        printInfo(`Model path is a file: ${modelPath}`);
+    }
+
     if (!fs.existsSync(tokenizerPath)) {
       throw new Error(`Tokenizer file not found: ${tokenizerPath}`);
     }
@@ -184,7 +173,12 @@ async function runTests() {
       console.time('Generation time');
 
       try {
-        const generated = engine.generateText(prompt, maxTokens);
+        // Use new options API
+        const generated = engine.generateText(prompt, maxTokens, {
+            temperature: 0.7,
+            topP: 0.9,
+            seed: 42
+        });
         console.timeEnd('Generation time');
 
         console.log(`\n${colors.bright}${colors.green}Generated Text:${colors.reset}`);

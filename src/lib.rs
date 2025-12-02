@@ -108,10 +108,39 @@ impl OxideEngine {
         log::info!("Model config: vocab_size={}, hidden_size={}, num_layers={}",
             config.vocab_size, config.hidden_size, config.num_hidden_layers);
 
-        // Load model weights from safetensors
-        let model_path = PathBuf::from(&model_path);
+        // Handle model loading (single file or sharded directory)
+        let model_path_buf = PathBuf::from(&model_path);
+        let mut model_files = Vec::new();
+
+        if model_path_buf.is_dir() {
+            log::info!("Model path is a directory, scanning for .safetensors files...");
+            let entries = std::fs::read_dir(&model_path_buf)?;
+            for entry in entries {
+                let entry = entry?;
+                let path = entry.path();
+                if let Some(ext) = path.extension() {
+                    if ext == "safetensors" {
+                        model_files.push(path);
+                    }
+                }
+            }
+            
+            // Sort files to ensure deterministic loading order (e.g., model-00001, model-00002)
+            model_files.sort();
+            
+            if model_files.is_empty() {
+                return Err(anyhow::anyhow!("No .safetensors files found in directory: {}", model_path));
+            }
+            
+            log::info!("Found {} model shards: {:?}", model_files.len(), model_files);
+        } else {
+            log::info!("Loading single model file: {:?}", model_path_buf);
+            model_files.push(model_path_buf);
+        }
+
+        // Load model weights from all found safetensors files
         let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(&[model_path], candle_core::DType::F32, &self.device)?
+            VarBuilder::from_mmaped_safetensors(&model_files, candle_core::DType::F32, &self.device)?
         };
 
         log::info!("Creating model with pre-computed RoPE embeddings...");
