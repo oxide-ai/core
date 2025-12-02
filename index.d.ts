@@ -6,13 +6,31 @@ export declare class OxideEngine {
   constructor()
   /** Get device information as a string */
   getDeviceInfo(): string
+  /** Load a Phi-3 model from a safetensors file */
+  loadModel(modelPath: string, configPath?: string | undefined | null): string
+  /**
+   * Run forward pass on the model
+   * Takes a list of token IDs and returns logits information
+   */
+  forward(tokenIds: Array<number>): ForwardResult
   /**
    * Test GPU compute capability by performing a simple tensor operation
    * Creates two tensors on the GPU, adds them, and returns the result
    */
   testGpuCompute(): string
-  /** Perform a more complex computation: element-wise multiplication */
-  testMultiply(a: number, b: number): string
-  /** Create a simple tensor and return its shape information */
-  createTensorInfo(values: Array<number>): string
+}
+
+/** Result of a forward pass */
+export interface ForwardResult {
+  batchSize: number
+  sequenceLength: number
+  vocabSize: number
+  topTokens: Array<TokenProb>
+  message: string
+}
+
+/** Token with its probability/logit */
+export interface TokenProb {
+  tokenId: number
+  logit: number
 }

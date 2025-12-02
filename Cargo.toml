@@ -15,7 +15,11 @@ napi-derive = "3.0.0"
 
 # Candle ML framework with Metal backend for macOS
 candle-core = { version = "0.9", features = ["metal"] }
+candle-nn = "0.9"
+candle-transformers = "0.9"
 anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 
 # Async Runtime & Logging
 tokio = { version = "1", features = ["full"] }
