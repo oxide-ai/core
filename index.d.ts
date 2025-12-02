@@ -6,8 +6,10 @@ export declare class OxideEngine {
   constructor()
   /** Get device information as a string */
   getDeviceInfo(): string
-  /** Load a Phi-3 model from a safetensors file */
-  loadModel(modelPath: string, configPath?: string | undefined | null): string
+  /** Load a Phi-3 model from a safetensors file with tokenizer */
+  loadModel(modelPath: string, tokenizerPath: string, configPath?: string | undefined | null): string
+  /** Generate text from a prompt */
+  generateText(prompt: string, maxTokens: number, options?: GenOptions | undefined | null): string
   /** Reset KV cache - call this when starting a new conversation */
   resetCache(): string
   /** Get current cache statistics */
@@ -39,6 +41,14 @@ export interface ForwardResult {
   cacheLength: number
   topTokens: Array<TokenProb>
   message: string
+}
+
+/** Generation options for text generation */
+export interface GenOptions {
+  temperature?: number
+  topP?: number
+  seed?: number
+  eosTokenId?: number
 }
 
 /** Token with its probability/logit */

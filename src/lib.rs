@@ -18,7 +18,6 @@ pub struct OxideEngine {
     model: Option<Model>,
     kv_cache: Option<KVCache>,
     tokenizer: Option<Tokenizer>,
-    logits_processor: LogitsProcessor,
 }
 
 #[napi]
@@ -37,18 +36,11 @@ impl OxideEngine {
 
         log::info!("OxideEngine initialized successfully with device: {:?}", device);
 
-        // Initialize LogitsProcessor with default parameters
-        let seed = 42;
-        let temperature = 0.8;
-        let top_p = Some(0.9);
-        let logits_processor = LogitsProcessor::new(seed, Some(temperature), top_p);
-
         Ok(Self {
             device,
             model: None,
             kv_cache: None,
             tokenizer: None,
-            logits_processor,
         })
     }
 
@@ -151,8 +143,7 @@ impl OxideEngine {
              Features:\n\
              ✓ KV Cache: Enabled (O(1) complexity)\n\
              ✓ RoPE: Pre-computed\n\
-             ✓ Tokenizer: Loaded\n\
-             ✓ LogitsProcessor: Temp=0.8, TopP=0.9",
+             ✓ Tokenizer: Loaded",
             config.vocab_size,
             config.hidden_size,
             config.num_hidden_layers,
@@ -164,17 +155,17 @@ impl OxideEngine {
 
     /// Generate text from a prompt
     #[napi]
-    pub fn generate_text(&mut self, prompt: String, max_tokens: u32) -> Result<String> {
+    pub fn generate_text(&mut self, prompt: String, max_tokens: u32, options: Option<GenOptions>) -> Result<String> {
         log::info!("Generating text from prompt: '{}', max_tokens: {}", prompt, max_tokens);
 
-        let result = self.generate_text_internal(&prompt, max_tokens as usize)
+        let result = self.generate_text_internal(&prompt, max_tokens as usize, options)
             .map_err(|e| Error::from_reason(format!("Text generation failed: {}", e)))?;
 
         Ok(result)
     }
 
     /// Internal text generation implementation
-    fn generate_text_internal(&mut self, prompt: &str, max_tokens: usize) -> AnyhowResult<String> {
+    fn generate_text_internal(&mut self, prompt: &str, max_tokens: usize, options: Option<GenOptions>) -> AnyhowResult<String> {
         let model = self.model.as_ref()
             .ok_or_else(|| anyhow::anyhow!("Model not loaded. Call load_model() first."))?;
 
@@ -183,6 +174,20 @@ impl OxideEngine {
 
         let tokenizer = self.tokenizer.as_ref()
             .ok_or_else(|| anyhow::anyhow!("Tokenizer not loaded. Call load_model() first."))?;
+
+        // Resolve options
+        let temperature = options.as_ref().and_then(|o| o.temperature).unwrap_or(0.8);
+        let top_p = options.as_ref().and_then(|o| o.top_p).or(Some(0.9));
+        let seed = options.as_ref().and_then(|o| o.seed).map(|s| s as u64).unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(42)
+        });
+
+        log::info!("Generation params: temp={:.2}, top_p={:?}, seed={}", temperature, top_p, seed);
+
+        let mut logits_processor = LogitsProcessor::new(seed, Some(temperature), top_p);
 
         // Encode the prompt
         let encoding = tokenizer
@@ -195,10 +200,14 @@ impl OxideEngine {
         log::info!("Prompt encoded to {} tokens", prompt_len);
 
         // Get EOS token ID
-        let eos_token_id = tokenizer
-            .token_to_id("<|endoftext|>")
-            .or_else(|| tokenizer.token_to_id("</s>"))
-            .unwrap_or(0);
+        let eos_token_id = if let Some(id) = options.as_ref().and_then(|o| o.eos_token_id) {
+             id
+        } else {
+             tokenizer.token_to_id("<|endoftext|>")
+                .or_else(|| tokenizer.token_to_id("</s>"))
+                .or_else(|| tokenizer.token_to_id("<|im_end|>"))
+                .unwrap_or(0)
+        };
 
         log::info!("EOS token ID: {}", eos_token_id);
 
@@ -224,7 +233,7 @@ impl OxideEngine {
             let last_logits = logits.i((0, 0))?;
 
             // Sample next token using logits processor
-            let next_token = self.logits_processor.sample(&last_logits)?;
+            let next_token = logits_processor.sample(&last_logits)?;
 
             // Check for EOS
             if next_token == eos_token_id {
@@ -242,7 +251,7 @@ impl OxideEngine {
             generated_count += 1;
 
             if step % 10 == 0 {
-                log::info!("Generated {} tokens...", step + 1);
+                log::debug!("Generated {} tokens...", step + 1);
             }
         }
 
@@ -456,4 +465,13 @@ pub struct CacheInfo {
     pub sequence_length: u32,
     pub is_empty: bool,
     pub message: String,
+}
+
+/// Generation options for text generation
+#[napi(object)]
+pub struct GenOptions {
+    pub temperature: Option<f64>,
+    pub top_p: Option<f64>,
+    pub seed: Option<i64>,
+    pub eos_token_id: Option<u32>,
 }
