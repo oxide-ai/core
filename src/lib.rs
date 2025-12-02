@@ -139,8 +139,14 @@ impl OxideEngine {
         }
 
         // Load model weights from all found safetensors files
+        let dtype = if let Device::Metal(_) = self.device {
+            candle_core::DType::F16
+        } else {
+            candle_core::DType::F32
+        };
+
         let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(&model_files, candle_core::DType::F32, &self.device)?
+            VarBuilder::from_mmaped_safetensors(&model_files, dtype, &self.device)?
         };
 
         log::info!("Creating model with pre-computed RoPE embeddings...");
@@ -238,12 +244,18 @@ impl OxideEngine {
                 .unwrap_or(0)
         };
 
+        // EOS token ID: ...
+
         log::info!("EOS token ID: {}", eos_token_id);
 
         // Process prompt tokens (prefill phase)
-        log::info!("Processing prompt tokens...");
-        let input_ids = Tensor::new(&token_ids[..], &self.device)?.unsqueeze(0)?;
-        let _logits = model.forward(&input_ids, kv_cache)?;
+        let len = token_ids.len();
+        if len > 1 {
+            log::info!("Processing prompt tokens (prefill)...");
+            let prefill_ids = &token_ids[..len - 1];
+            let input_ids = Tensor::new(prefill_ids, &self.device)?.unsqueeze(0)?;
+            let _ = model.forward(&input_ids, kv_cache)?;
+        }
 
         log::info!("Prompt processed, starting generation...");
 
@@ -258,8 +270,11 @@ impl OxideEngine {
 
             let logits = model.forward(&input_tensor, kv_cache)?;
 
-            // Get logits for last token
-            let last_logits = logits.i((0, 0))?;
+            // Get logits for last token, cast to F32, and move to CPU for sampling
+            // This avoids "no metal implementation for softmax" errors and is safer/faster for the single-token sampling step
+            let last_logits = logits.i((0, 0))?
+                .to_dtype(candle_core::DType::F32)?
+                .to_device(&candle_core::Device::Cpu)?;
 
             // Sample next token using logits processor
             let next_token = logits_processor.sample(&last_logits)?;

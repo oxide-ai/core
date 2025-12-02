@@ -151,6 +151,8 @@ impl RotaryEmbedding {
 
         let cos = freqs.cos()?;
         let sin = freqs.sin()?;
+        let cos = Tensor::cat(&[&cos, &cos], 1)?;
+        let sin = Tensor::cat(&[&sin, &sin], 1)?;
 
         Ok(Self { cos, sin })
     }
@@ -202,8 +204,10 @@ fn rotate_half(xs: &Tensor) -> Result<Tensor> {
 }
 
 fn apply_rotary_emb(q: &Tensor, k: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<(Tensor, Tensor)> {
-    let q_embed = (q.broadcast_mul(cos)? + rotate_half(q)?.broadcast_mul(sin)?)?;
-    let k_embed = (k.broadcast_mul(cos)? + rotate_half(k)?.broadcast_mul(sin)?)?;
+    let cos = cos.to_dtype(q.dtype())?;
+    let sin = sin.to_dtype(q.dtype())?;
+    let q_embed = (q.broadcast_mul(&cos)? + rotate_half(q)?.broadcast_mul(&sin)?)?;
+    let k_embed = (k.broadcast_mul(&cos)? + rotate_half(k)?.broadcast_mul(&sin)?)?;
     Ok((q_embed, k_embed))
 }
 
@@ -299,9 +303,26 @@ impl Attention {
         let (k, v) = kv_cache.append(new_k, new_v)?;
 
         // Scaled dot-product attention
-        let att = (q.matmul(&k.transpose(2, 3)?)? / (self.head_dim as f64).sqrt())?;
-        let att = candle_nn::ops::softmax_last_dim(&att)?;
+        let (b_sz, head_num, q_seq_len, head_dim) = q.dims4()?;
+        let k_seq_len = k.dim(2)?;
+        
+        let q = q.reshape((b_sz * head_num, q_seq_len, head_dim))?;
+        let k_t = k.transpose(2, 3)?.reshape((b_sz * head_num, head_dim, k_seq_len))?;
+        let v = v.reshape((b_sz * head_num, k_seq_len, head_dim))?;
+
+        let att = (q.matmul(&k_t)? / (self.head_dim as f64).sqrt())?;
+        
+        // Manual softmax on 3D tensor
+        let att = {
+            let max = att.max_keepdim(candle_core::D::Minus1)?;
+            let att = att.broadcast_sub(&max)?;
+            let att = att.exp()?;
+            let sum = att.sum_keepdim(candle_core::D::Minus1)?;
+            att.broadcast_div(&sum)?
+        };
+
         let out = att.matmul(&v)?;
+        let out = out.reshape((b_sz, head_num, q_seq_len, head_dim))?;
 
         let out = out
             .transpose(1, 2)?
