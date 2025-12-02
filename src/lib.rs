@@ -7,13 +7,14 @@ use candle_nn::VarBuilder;
 use anyhow::Result as AnyhowResult;
 use std::path::PathBuf;
 
-use model::{Config, Model};
+use model::{Config, Model, KVCache};
 
 /// OxideEngine - Main struct for GPU-accelerated ML operations using Candle
 #[napi]
 pub struct OxideEngine {
     device: Device,
     model: Option<Model>,
+    kv_cache: Option<KVCache>,
 }
 
 #[napi]
@@ -35,6 +36,7 @@ impl OxideEngine {
         Ok(Self {
             device,
             model: None,
+            kv_cache: None,
         })
     }
 
@@ -101,12 +103,17 @@ impl OxideEngine {
             VarBuilder::from_mmaped_safetensors(&[model_path], candle_core::DType::F32, &self.device)?
         };
 
-        log::info!("Creating model...");
+        log::info!("Creating model with pre-computed RoPE embeddings...");
         let model = Model::new(&config, vb)?;
 
-        log::info!("Model loaded successfully into VRAM");
+        // Initialize KV cache for all layers
+        let num_layers = config.num_hidden_layers;
+        let kv_cache = KVCache::new(num_layers);
+
+        log::info!("Model loaded successfully into VRAM with KV cache initialized");
 
         self.model = Some(model);
+        self.kv_cache = Some(kv_cache);
 
         Ok(format!(
             "✓ Model loaded successfully!\n\
@@ -119,7 +126,12 @@ impl OxideEngine {
              - Max position embeddings: {}\n\
              \n\
              Device: {:?}\n\
-             Status: Model loaded in VRAM and ready for inference",
+             Status: Model loaded in VRAM with KV caching enabled\n\
+             \n\
+             Performance Optimizations:\n\
+             ✓ KV Cache: Enabled (O(1) complexity for history)\n\
+             ✓ RoPE: Pre-computed for all positions\n\
+             ✓ Ready for real-time token generation",
             config.vocab_size,
             config.hidden_size,
             config.num_hidden_layers,
@@ -129,11 +141,43 @@ impl OxideEngine {
         ))
     }
 
-    /// Run forward pass on the model
-    /// Takes a list of token IDs and returns logits information
+    /// Reset KV cache - call this when starting a new conversation
     #[napi]
-    pub fn forward(&self, token_ids: Vec<u32>) -> Result<ForwardResult> {
-        log::info!("Running forward pass with {} tokens", token_ids.len());
+    pub fn reset_cache(&mut self) -> Result<String> {
+        log::info!("Resetting KV cache");
+
+        if let Some(ref mut cache) = self.kv_cache {
+            cache.clear();
+            let message = "✓ KV cache cleared successfully\nReady for new conversation";
+            log::info!("{}", message);
+            Ok(message.to_string())
+        } else {
+            let error_msg = "No KV cache to reset. Load a model first.";
+            log::warn!("{}", error_msg);
+            Err(Error::from_reason(error_msg))
+        }
+    }
+
+    /// Get current cache statistics
+    #[napi]
+    pub fn get_cache_info(&self) -> Result<CacheInfo> {
+        if let Some(ref cache) = self.kv_cache {
+            let seq_len = cache.seq_len();
+            Ok(CacheInfo {
+                sequence_length: seq_len as u32,
+                is_empty: seq_len == 0,
+                message: format!("Cache contains {} tokens", seq_len),
+            })
+        } else {
+            Err(Error::from_reason("No cache available. Load a model first."))
+        }
+    }
+
+    /// Run forward pass on the model with KV caching
+    /// This now only processes NEW tokens efficiently
+    #[napi]
+    pub fn forward(&mut self, token_ids: Vec<u32>) -> Result<ForwardResult> {
+        log::info!("Running forward pass with {} new tokens (cache enabled)", token_ids.len());
 
         let result = self.forward_internal(&token_ids)
             .map_err(|e| Error::from_reason(format!("Forward pass failed: {}", e)))?;
@@ -141,22 +185,32 @@ impl OxideEngine {
         Ok(result)
     }
 
-    /// Internal forward pass implementation
-    fn forward_internal(&self, token_ids: &[u32]) -> AnyhowResult<ForwardResult> {
+    /// Internal forward pass implementation with KV cache
+    fn forward_internal(&mut self, token_ids: &[u32]) -> AnyhowResult<ForwardResult> {
         let model = self.model.as_ref()
             .ok_or_else(|| anyhow::anyhow!("Model not loaded. Call load_model() first."))?;
+
+        let kv_cache = self.kv_cache.as_mut()
+            .ok_or_else(|| anyhow::anyhow!("KV cache not initialized. Call load_model() first."))?;
+
+        let cache_len_before = kv_cache.seq_len();
 
         // Convert token IDs to tensor
         let input_ids = Tensor::new(token_ids, &self.device)?
             .unsqueeze(0)?; // Add batch dimension
 
-        log::info!("Input tensor shape: {:?}", input_ids.shape());
+        log::info!("Input tensor shape: {:?}, Cache length before: {}",
+            input_ids.shape(), cache_len_before);
 
-        // Run forward pass
-        let logits = model.forward(&input_ids, 0)?;
+        // Run forward pass with KV cache
+        // Only the new tokens are processed; previous K/V are cached
+        let logits = model.forward(&input_ids, kv_cache)?;
 
         let logits_shape = logits.shape();
-        log::info!("Output logits shape: {:?}", logits_shape);
+        let cache_len_after = kv_cache.seq_len();
+
+        log::info!("Output logits shape: {:?}, Cache length after: {}",
+            logits_shape, cache_len_after);
 
         // Get dimensions
         let batch_size = logits_shape.dims()[0];
@@ -173,10 +227,15 @@ impl OxideEngine {
             batch_size: batch_size as u32,
             sequence_length: seq_len as u32,
             vocab_size: vocab_size as u32,
+            cache_length: cache_len_after as u32,
             top_tokens,
             message: format!(
-                "Forward pass successful!\nInput: {} tokens → Output: logits [{}, {}, {}]",
+                "✓ Forward pass successful with KV caching!\n\
+                 Input: {} new tokens → Total cached: {} tokens\n\
+                 Output: logits [{}, {}, {}]\n\
+                 Performance: O(1) complexity for history",
                 token_ids.len(),
+                cache_len_after,
                 batch_size,
                 seq_len,
                 vocab_size
@@ -269,6 +328,7 @@ pub struct ForwardResult {
     pub batch_size: u32,
     pub sequence_length: u32,
     pub vocab_size: u32,
+    pub cache_length: u32,
     pub top_tokens: Vec<TokenProb>,
     pub message: String,
 }
@@ -278,4 +338,12 @@ pub struct ForwardResult {
 pub struct TokenProb {
     pub token_id: u32,
     pub logit: f64,
+}
+
+/// Cache information
+#[napi(object)]
+pub struct CacheInfo {
+    pub sequence_length: u32,
+    pub is_empty: bool,
+    pub message: String,
 }

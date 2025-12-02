@@ -44,6 +44,126 @@ impl Config {
     }
 }
 
+/// Key-Value Cache for a single layer
+/// Stores cached K and V tensors to avoid recomputation
+#[derive(Debug, Clone)]
+pub struct LayerKVCache {
+    pub key_cache: Option<Tensor>,
+    pub value_cache: Option<Tensor>,
+}
+
+impl LayerKVCache {
+    pub fn new() -> Self {
+        Self {
+            key_cache: None,
+            value_cache: None,
+        }
+    }
+
+    /// Append new K/V to cache and return concatenated tensors
+    pub fn append(&mut self, new_k: Tensor, new_v: Tensor) -> Result<(Tensor, Tensor)> {
+        let k = if let Some(ref cached_k) = self.key_cache {
+            Tensor::cat(&[cached_k, &new_k], 2)?
+        } else {
+            new_k.clone()
+        };
+
+        let v = if let Some(ref cached_v) = self.value_cache {
+            Tensor::cat(&[cached_v, &new_v], 2)?
+        } else {
+            new_v.clone()
+        };
+
+        self.key_cache = Some(k.clone());
+        self.value_cache = Some(v.clone());
+
+        Ok((k, v))
+    }
+
+    pub fn clear(&mut self) {
+        self.key_cache = None;
+        self.value_cache = None;
+    }
+
+    pub fn seq_len(&self) -> usize {
+        self.key_cache
+            .as_ref()
+            .map(|k| k.dim(2).unwrap_or(0))
+            .unwrap_or(0)
+    }
+}
+
+/// KV Cache for all layers
+#[derive(Debug, Clone)]
+pub struct KVCache {
+    caches: Vec<LayerKVCache>,
+}
+
+impl KVCache {
+    pub fn new(num_layers: usize) -> Self {
+        Self {
+            caches: (0..num_layers).map(|_| LayerKVCache::new()).collect(),
+        }
+    }
+
+    pub fn get_layer_cache(&mut self, layer_idx: usize) -> &mut LayerKVCache {
+        &mut self.caches[layer_idx]
+    }
+
+    pub fn clear(&mut self) {
+        for cache in &mut self.caches {
+            cache.clear();
+        }
+    }
+
+    pub fn seq_len(&self) -> usize {
+        self.caches.first().map(|c| c.seq_len()).unwrap_or(0)
+    }
+}
+
+/// Pre-computed rotary embeddings
+#[derive(Debug, Clone)]
+pub struct RotaryEmbedding {
+    cos: Tensor,
+    sin: Tensor,
+}
+
+impl RotaryEmbedding {
+    /// Pre-compute rotary embeddings for all positions
+    pub fn new(cfg: &Config, device: &Device) -> Result<Self> {
+        let head_dim = cfg.head_dim();
+        let theta = cfg.rope_theta;
+        let max_seq_len = cfg.max_position_embeddings;
+
+        // Pre-compute inverse frequencies
+        let inv_freq: Vec<_> = (0..head_dim)
+            .step_by(2)
+            .map(|i| 1f32 / theta.powf(i as f64 / head_dim as f64) as f32)
+            .collect();
+        let inv_freq_len = inv_freq.len();
+        let inv_freq = Tensor::from_vec(inv_freq, (1, inv_freq_len), device)?;
+
+        // Pre-compute all positions
+        let t = Tensor::arange(0u32, max_seq_len as u32, device)?
+            .to_dtype(DType::F32)?
+            .reshape((max_seq_len, 1))?;
+        let freqs = t.matmul(&inv_freq)?;
+
+        let cos = freqs.cos()?;
+        let sin = freqs.sin()?;
+
+        Ok(Self { cos, sin })
+    }
+
+    /// Get rotary embeddings for specific positions
+    pub fn forward(&self, seq_len: usize, start_pos: usize) -> Result<(Tensor, Tensor)> {
+        let end_pos = start_pos + seq_len;
+        let cos = self.cos.i(start_pos..end_pos)?.unsqueeze(0)?.unsqueeze(0)?;
+        let sin = self.sin.i(start_pos..end_pos)?.unsqueeze(0)?.unsqueeze(0)?;
+        Ok((cos, sin))
+    }
+}
+
 /// RMS Normalization layer
 #[derive(Debug)]
 struct RmsNorm {
@@ -87,7 +207,7 @@ fn apply_rotary_emb(q: &Tensor, k: &Tensor, cos: &Tensor, sin: &Tensor) -> Resul
     Ok((q_embed, k_embed))
 }
 
-/// Multi-Head Attention
+/// Multi-Head Attention with KV Cache support
 #[derive(Debug)]
 struct Attention {
     q_proj: Linear,
@@ -122,29 +242,38 @@ impl Attention {
         })
     }
 
+    /// Forward pass with KV cache
+    /// Only processes new tokens (xs) and uses cached K/V for previous tokens
     fn forward(
         &self,
         xs: &Tensor,
         cos: &Tensor,
         sin: &Tensor,
+        kv_cache: &mut LayerKVCache,
     ) -> Result<Tensor> {
         let (b_sz, seq_len, _) = xs.dims3()?;
 
+        // Project new tokens
         let q = self.q_proj.forward(xs)?;
         let k = self.k_proj.forward(xs)?;
         let v = self.v_proj.forward(xs)?;
 
+        // Reshape for multi-head attention
         let q = q
             .reshape((b_sz, seq_len, self.num_heads, self.head_dim))?
             .transpose(1, 2)?;
-        let k = k
+        let new_k = k
             .reshape((b_sz, seq_len, self.num_kv_heads, self.head_dim))?
             .transpose(1, 2)?;
-        let v = v
+        let new_v = v
             .reshape((b_sz, seq_len, self.num_kv_heads, self.head_dim))?
             .transpose(1, 2)?;
 
-        let (q, k) = apply_rotary_emb(&q, &k, cos, sin)?;
+        // Apply rotary embeddings to Q and new K
+        let (q, new_k) = apply_rotary_emb(&q, &new_k, cos, sin)?;
+
+        // Append to cache and get full K, V
+        let (k, v) = kv_cache.append(new_k, new_v)?;
 
         // Scaled dot-product attention
         let att = (q.matmul(&k.transpose(2, 3)?)? / (self.head_dim as f64).sqrt())?;
@@ -192,7 +321,7 @@ impl Mlp {
     }
 }
 
-/// Transformer Decoder Layer
+/// Transformer Decoder Layer with KV Cache
 #[derive(Debug)]
 struct DecoderLayer {
     self_attn: Attention,
@@ -221,10 +350,11 @@ impl DecoderLayer {
         xs: &Tensor,
         cos: &Tensor,
         sin: &Tensor,
+        kv_cache: &mut LayerKVCache,
     ) -> Result<Tensor> {
         let residual = xs;
         let xs = self.input_layernorm.forward(xs)?;
-        let xs = self.self_attn.forward(&xs, cos, sin)?;
+        let xs = self.self_attn.forward(&xs, cos, sin, kv_cache)?;
         let xs = (xs + residual)?;
 
         let residual = &xs;
@@ -234,13 +364,14 @@ impl DecoderLayer {
     }
 }
 
-/// Main Phi-3 Model
+/// Main Phi-3 Model with KV Caching
 #[derive(Debug)]
 pub struct Model {
     embed_tokens: Embedding,
     layers: Vec<DecoderLayer>,
     norm: RmsNorm,
     lm_head: Linear,
+    rope: RotaryEmbedding,
     device: Device,
     config: Config,
 }
@@ -259,53 +390,40 @@ impl Model {
         let norm = RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("model.norm"))?;
         let lm_head = linear_no_bias(cfg.hidden_size, cfg.vocab_size, vb.pp("lm_head"))?;
 
+        // Pre-compute rotary embeddings
+        let rope = RotaryEmbedding::new(cfg, vb.device())?;
+
         Ok(Self {
             embed_tokens,
             layers,
             norm,
             lm_head,
+            rope,
             device: vb.device().clone(),
             config: cfg.clone(),
         })
     }
 
-    pub fn forward(&self, input_ids: &Tensor, pos: usize) -> Result<Tensor> {
+    /// Forward pass with KV cache
+    /// Only processes new tokens efficiently using cached K/V from previous steps
+    pub fn forward(&self, input_ids: &Tensor, kv_cache: &mut KVCache) -> Result<Tensor> {
         let (_b_sz, seq_len) = input_ids.dims2()?;
         let mut xs = self.embed_tokens.forward(input_ids)?;
 
-        // Create rotary embeddings
-        let (cos, sin) = self.create_rotary_embeddings(seq_len, pos)?;
+        // Get position for RoPE (start from cache length)
+        let start_pos = kv_cache.seq_len();
+        let (cos, sin) = self.rope.forward(seq_len, start_pos)?;
 
-        for layer in &self.layers {
-            xs = layer.forward(&xs, &cos, &sin)?;
+        // Process through all layers with KV cache
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            let layer_cache = kv_cache.get_layer_cache(layer_idx);
+            xs = layer.forward(&xs, &cos, &sin, layer_cache)?;
         }
 
         let xs = self.norm.forward(&xs)?;
         let logits = self.lm_head.forward(&xs)?;
 
         Ok(logits)
-    }
-
-    fn create_rotary_embeddings(&self, seq_len: usize, start_pos: usize) -> Result<(Tensor, Tensor)> {
-        let head_dim = self.config.head_dim();
-        let theta = self.config.rope_theta;
-
-        let inv_freq: Vec<_> = (0..head_dim)
-            .step_by(2)
-            .map(|i| 1f32 / theta.powf(i as f64 / head_dim as f64) as f32)
-            .collect();
-        let inv_freq_len = inv_freq.len();
-        let inv_freq = Tensor::from_vec(inv_freq, (1, inv_freq_len), &self.device)?;
-
-        let t = Tensor::arange(start_pos as u32, (start_pos + seq_len) as u32, &self.device)?
-            .to_dtype(DType::F32)?
-            .reshape((seq_len, 1))?;
-        let freqs = t.matmul(&inv_freq)?;
-
-        let cos = freqs.cos()?.unsqueeze(0)?.unsqueeze(0)?;
-        let sin = freqs.sin()?.unsqueeze(0)?.unsqueeze(0)?;
-
-        Ok((cos, sin))
     }
 
     pub fn config(&self) -> &Config {

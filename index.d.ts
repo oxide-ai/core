@@ -8,9 +8,13 @@ export declare class OxideEngine {
   getDeviceInfo(): string
   /** Load a Phi-3 model from a safetensors file */
   loadModel(modelPath: string, configPath?: string | undefined | null): string
+  /** Reset KV cache - call this when starting a new conversation */
+  resetCache(): string
+  /** Get current cache statistics */
+  getCacheInfo(): CacheInfo
   /**
-   * Run forward pass on the model
-   * Takes a list of token IDs and returns logits information
+   * Run forward pass on the model with KV caching
+   * This now only processes NEW tokens efficiently
    */
   forward(tokenIds: Array<number>): ForwardResult
   /**
@@ -20,11 +24,19 @@ export declare class OxideEngine {
   testGpuCompute(): string
 }
 
+/** Cache information */
+export interface CacheInfo {
+  sequenceLength: number
+  isEmpty: boolean
+  message: string
+}
+
 /** Result of a forward pass */
 export interface ForwardResult {
   batchSize: number
   sequenceLength: number
   vocabSize: number
+  cacheLength: number
   topTokens: Array<TokenProb>
   message: string
 }
