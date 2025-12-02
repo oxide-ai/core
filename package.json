@@ -50,6 +50,7 @@
     "lint": "oxlint .",
     "prepublishOnly": "napi prepublish -t npm",
     "test": "ava",
+    "test:gpu": "node test.js",
     "preversion": "napi build --platform && git add .",
     "version": "napi version",
     "prepare": "husky"

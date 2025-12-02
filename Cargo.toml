@@ -9,8 +9,15 @@ version = "0.1.0"
 crate-type = ["cdylib"]
 
 [dependencies]
+# Napi bindings
 napi = "3.0.0"
 napi-derive = "3.0.0"
+
+# WebGPU & Async Runtime
+wgpu = "0.19" # O l'ultima versione stabile
+tokio = { version = "1", features = ["full"] }
+log = "0.4"
+env_logger = "0.11"
 
 [build-dependencies]
 napi-build = "2"
